@@ -1,0 +1,202 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Core;
+
+/** Helpers for the first-run wizard (public/setup.php). */
+final class Installer
+{
+    /**
+     * Validate the setup form.
+     *
+     * @return array{0: list<string>, 1: array<string,mixed>} [errors, cleaned values]
+     */
+    public static function validate(Request $req): array
+    {
+        $errors = [];
+        $v = [
+            'app_name'     => trim((string) $req->post('app_name')),
+            'db_host'      => trim((string) $req->post('db_host')),
+            'db_port'      => (int) $req->post('db_port'),
+            'db_name'      => trim((string) $req->post('db_name')),
+            'db_user'      => trim((string) $req->post('db_user')),
+            'db_pass'      => (string) $req->post('db_pass'),
+            'idle_minutes' => (int) $req->post('idle_minutes'),
+            'admin_user'   => trim((string) $req->post('admin_user')),
+            'admin_first'  => trim((string) $req->post('admin_first')),
+            'admin_last'   => trim((string) $req->post('admin_last')),
+            'admin_email'  => trim((string) $req->post('admin_email')),
+            'admin_pass'   => (string) $req->post('admin_pass'),
+            'admin_pass2'  => (string) $req->post('admin_pass2'),
+        ];
+
+        if ($v['app_name'] === '' || mb_strlen($v['app_name']) > 64) {
+            $errors[] = 'Enter an application name (up to 64 characters).';
+        }
+        // Strict patterns also keep ";" and "=" out of the PDO DSN string.
+        if (!preg_match('/^[A-Za-z0-9._:\-\[\]]{1,255}$/', $v['db_host'])) {
+            $errors[] = 'Enter a valid database host name or IP address.';
+        }
+        if ($v['db_port'] < 1 || $v['db_port'] > 65535) {
+            $errors[] = 'The database port must be between 1 and 65535.';
+        }
+        if (!preg_match('/^[A-Za-z0-9_$\-]{1,64}$/', $v['db_name'])) {
+            $errors[] = 'Enter a valid database name (letters, numbers, _ $ -).';
+        }
+        if ($v['db_user'] === '') {
+            $errors[] = 'Enter the database user.';
+        }
+        if ($v['idle_minutes'] < 1 || $v['idle_minutes'] > 1440) {
+            $errors[] = 'The inactivity timeout must be between 1 and 1440 minutes.';
+        }
+
+        if (!preg_match('/^[A-Za-z0-9._@-]{1,64}$/', $v['admin_user'])) {
+            $errors[] = 'Administrator username: up to 64 letters, numbers or . _ @ -';
+        }
+        if (strlen($v['admin_pass']) < Auth::MIN_PASSWORD) {
+            $errors[] = 'The administrator password must be at least ' . Auth::MIN_PASSWORD . ' characters.';
+        } elseif (strlen($v['admin_pass']) > Auth::MAX_PASSWORD) {
+            $errors[] = 'The administrator password can be at most ' . Auth::MAX_PASSWORD . ' characters (letters outside A to Z count as more than one).';
+        }
+        if ($v['admin_pass'] !== $v['admin_pass2']) {
+            $errors[] = 'The administrator passwords do not match.';
+        }
+        if ($v['admin_email'] !== '' && (mb_strlen($v['admin_email']) > 128 || !filter_var($v['admin_email'], FILTER_VALIDATE_EMAIL))) {
+            $errors[] = 'Enter a valid administrator email address of up to 128 characters (or leave it blank).';
+        }
+        if (mb_strlen($v['admin_first']) > 32 || mb_strlen($v['admin_last']) > 32) {
+            $errors[] = 'The administrator first and last names can be at most 32 characters.';
+        }
+
+        return [$errors, $v];
+    }
+
+    /**
+     * A cookie name for this app's session, from its name ("My App" -> "my_app_session"). Two apps on the
+     * same host (different ports, or paths) would otherwise share one cookie name and sign each other out.
+     */
+    public static function sessionName(string $appName): string
+    {
+        $slug = trim((string) preg_replace('/[^a-z0-9]+/', '_', strtolower($appName)), '_');
+        return ($slug === '' || ctype_digit($slug) ? 'app' : substr($slug, 0, 24)) . '_session';
+    }
+
+    /** The structure written to config/config.php. */
+    public static function configValues(array $v): array
+    {
+        return [
+            'app' => ['name' => $v['app_name'], 'debug' => false],
+            'db'  => [
+                'host'    => $v['db_host'],
+                'port'    => $v['db_port'],
+                'name'    => $v['db_name'],
+                'user'    => $v['db_user'],
+                'pass'    => $v['db_pass'],
+                'charset' => 'utf8mb4',
+                'dsn'     => null,
+            ],
+            'session' => [
+                'name'         => self::sessionName($v['app_name']),
+                'idle_timeout' => $v['idle_minutes'] * 60,
+                'secure'       => null,
+            ],
+        ];
+    }
+
+    /** PHP source for the config file. var_export() escapes values, so no input can inject code. */
+    public static function configPhp(array $values): string
+    {
+        return "<?php\n// Generated by setup.php on " . date('Y-m-d H:i:s') . ".\n// Contains the database password: keep this file private and out of version control.\n\nreturn "
+            . var_export($values, true) . ";\n";
+    }
+
+    /**
+     * Create the config file. Opens with mode "x" (create-only), so an existing
+     * config can never be overwritten, even by a concurrent request.
+     *
+     * @throws \RuntimeException if the file cannot be created
+     */
+    public static function writeConfig(string $php): void
+    {
+        $path = Config::path();
+        $dir = dirname($path);
+        if (!is_dir($dir) || !is_writable($dir)) {
+            throw new \RuntimeException("The folder {$dir} is not writable by the web server.");
+        }
+        $fh = @fopen($path, 'x');
+        if ($fh === false) {
+            throw new \RuntimeException("Could not create {$path} (it may already exist).");
+        }
+        $ok = fwrite($fh, $php) === strlen($php);
+        fclose($fh);
+        @chmod($path, 0640);
+        if (!$ok) {
+            @unlink($path);
+            throw new \RuntimeException("Could not write to {$path}.");
+        }
+    }
+
+    /** True if the connection failed only because the named database doesn't exist (MySQL error 1049). */
+    public static function isUnknownDatabase(\PDOException $e): bool
+    {
+        return (int) $e->getCode() === 1049 || str_contains($e->getMessage(), '[1049]');
+    }
+
+    /**
+     * Create the database named in the setup values (the name was validated against
+     * a strict pattern, so quoting it in backticks is safe).
+     *
+     * @throws \RuntimeException
+     */
+    public static function createDatabase(array $v): void
+    {
+        try {
+            $pdo = new \PDO(
+                sprintf('mysql:host=%s;port=%d;charset=utf8mb4', $v['db_host'], $v['db_port']),
+                $v['db_user'],
+                $v['db_pass'],
+                [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]
+            );
+            $pdo->exec('CREATE DATABASE `' . $v['db_name'] . '` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
+        } catch (\PDOException $e) {
+            throw new \RuntimeException(
+                'The database "' . $v['db_name'] . '" does not exist and could not be created (the user needs the CREATE privilege, '
+                . 'or create it yourself first): ' . $e->getMessage()
+            );
+        }
+    }
+
+    /** Number of tables in the connected database. */
+    public static function tableCount(Database $db): int
+    {
+        return (int) $db->value('SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()');
+    }
+
+    /**
+     * Create an administrator, or promote and reset the password of an existing
+     * user with that username. Returns 'created' or 'updated'.
+     *
+     * @throws \RuntimeException
+     */
+    public static function saveAdmin(Database $db, array $v): string
+    {
+        $hash = password_hash($v['admin_pass'], PASSWORD_DEFAULT);
+        $existing = $db->one('SELECT user_id FROM users WHERE username = ?', [$v['admin_user']]);
+
+        try {
+            if ($existing !== null) {
+                $db->execute('UPDATE users SET password = ?, admin = 1, disabled = 0, must_change_password = 0 WHERE user_id = ?', [$hash, $existing['user_id']]);
+                return 'updated';
+            }
+            // user_id is auto-incremented. lastlogin's epoch means "never signed in".
+            $db->execute(
+                'INSERT INTO users (username, password, firstname, lastname, email, admin, timezone, lastlogin) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
+                [$v['admin_user'], $hash, $v['admin_first'], $v['admin_last'], $v['admin_email'], 'UTC', '1970-01-01 00:00:00']
+            );
+            return 'created';
+        } catch (\PDOException $e) {
+            throw new \RuntimeException('The administrator could not be saved: ' . $e->getMessage(), 0, $e);
+        }
+    }
+}
